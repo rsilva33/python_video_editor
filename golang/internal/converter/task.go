@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"imersaofc/internal/rabbitmq"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -12,15 +13,19 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/streadway/amqp"
 )
 
 type VideoConverter struct {
-	db *sql.DB
+	db             *sql.DB
+	rabbitmqClient *rabbitmq.RabbitClient
 }
 
-func NewVideoConverter(db *sql.DB) *VideoConverter {
+func NewVideoConverter(rabbitmqClient *rabbitmq.RabbitClient, db *sql.DB) *VideoConverter {
 	return &VideoConverter{
-		db: db,
+		rabbitmqClient: rabbitmqClient,
+		db:             db,
 	}
 }
 
@@ -31,11 +36,11 @@ type VideoTask struct {
 }
 
 // * = ponteiro, qualquer valor que for alterado utilizando vc. vai ser refletido no codigo
-func (vc *VideoConverter) Handle(msg []byte) {
+func (vc *VideoConverter) Handle(d amqp.Delivery, conversionExch, confirmationKey, confirmationQueue string) {
 	var task VideoTask
 
 	//& = quando o comando executar o task alterar na memoria o valor
-	err := json.Unmarshal(msg, &task)
+	err := json.Unmarshal(d.Body, &task)
 
 	if err != nil {
 		vc.logError(task, "Failed to unmarshal task", err)
@@ -44,6 +49,7 @@ func (vc *VideoConverter) Handle(msg []byte) {
 
 	if IsProcessed(vc.db, task.VideoId) {
 		slog.Warn("Video already processed", slog.Int("video_id", task.VideoId))
+		d.Ack(false)
 		return
 	}
 
@@ -57,49 +63,46 @@ func (vc *VideoConverter) Handle(msg []byte) {
 	err = MarkProcessed(vc.db, task.VideoId)
 	if err != nil {
 		vc.logError(task, "Failed to mark video as processed", err)
+		return
 	}
+	d.Ack(false)
 	slog.Info("Video marked as processed", slog.Int("video_id", task.VideoId))
+
+	confirmationMessage := []byte(fmt.Sprintf(`{"video_id": %d, "path":"%s"}`, task.VideoId, task.Path))
+	err = vc.rabbitmqClient.PublishMessage(conversionExch, confirmationKey, confirmationQueue, confirmationMessage)
 }
 
 func (vc *VideoConverter) processVideo(task *VideoTask) error {
 	mergedFile := filepath.Join(task.Path, "merged.mp4")
 	mpegDashPath := filepath.Join(task.Path, "mpeg-dash")
 
+	// Merge chunks
 	slog.Info("Merging chunks", slog.String("path", task.Path))
-	err := vc.mergeChunks(task.Path, mergedFile)
-	if err != nil {
-		vc.logError(*task, "Failed to merge chunks", err)
-		return err
-	}
-	slog.Info("Creating mpeg-dash dir", slog.String("path", task.Path))
-	err = os.MkdirAll(mpegDashPath, os.ModePerm)
-	if err != nil {
-		vc.logError(*task, "Failed to create mpeg-dash directory", err)
-		return err
+	if err := vc.mergeChunks(task.Path, mergedFile); err != nil {
+		return fmt.Errorf("failed to merge chunks: %v", err)
 	}
 
-	slog.Info("Converting video to mpeg-dash", slog.String("path", task.Path))
+	// Create directory for MPEG-DASH output
+	if err := os.MkdirAll(mpegDashPath, os.ModePerm); err != nil {
+		return fmt.Errorf("failed to create output directory: %v", err)
+	}
+
+	// Convert to MPEG-DASH
 	ffmpegCmd := exec.Command(
-		"ffmpeg", "-i", mergedFile,
-		"-f", "dash",
-		filepath.Join(mpegDashPath, "output.mpd"),
+		"ffmpeg", "-i", mergedFile, // Arquivo de entrada
+		"-f", "dash", // Formato de saída
+		filepath.Join(mpegDashPath, "output.mpd"), // Caminho para salvar o arquivo .mpd
 	)
-
 	output, err := ffmpegCmd.CombinedOutput()
 	if err != nil {
-		vc.logError(*task, "Failed to convert video to mpeg-dash, output"+string(output), err)
-		return err
+		return fmt.Errorf("failed to convert to MPEG-DASH: %v, output: %s", err, string(output))
 	}
-
-	slog.Info("Video converted to mpeg-dash", slog.String("path", mpegDashPath))
-
-	slog.Info("Removing merged file", slog.String("path", mergedFile))
-	err = os.Remove(mergedFile)
-	if err != nil {
-		vc.logError(*task, "Failed to remove merged file", err)
-		return err
+	slog.Info("Converted to MPEG-DASH", slog.String("path", mpegDashPath))
+	// Remove merged file after processing
+	if err := os.Remove(mergedFile); err != nil {
+		slog.Warn("Failed to remove merged file", slog.String("file", mergedFile), slog.String("error", err.Error()))
 	}
-
+	slog.Info("Removed merged file", slog.String("file", mergedFile))
 	return nil
 }
 
@@ -129,8 +132,9 @@ func (vc *VideoConverter) extractNumber(fileName string) int {
 	return num
 }
 
-func (vc *VideoConverter) mergeChunks(intputDir, outputFile string) error {
-	chunks, err := filepath.Glob(filepath.Join(intputDir, "*.chunk"))
+func (vc *VideoConverter) mergeChunks(inputDir, outputFile string) error {
+	// Buscar todos os arquivos .chunk no diretório
+	chunks, err := filepath.Glob(filepath.Join(inputDir, "*.chunk"))
 	if err != nil {
 		return fmt.Errorf("failed to find chunks: %v", err)
 	}
@@ -139,13 +143,13 @@ func (vc *VideoConverter) mergeChunks(intputDir, outputFile string) error {
 	//Ordenacao da lista que iremos trabalhar
 	sort.Slice(chunks, func(i, j int) bool {
 		//numero atual que esta e vai comparar se o i for menor que o extracNumber retorna true e nao muda a posicao, caso contrario muda
-		return vc.extractNumber(chunks[i]) < vc.extractNumber((chunks[j]))
+		return vc.extractNumber(chunks[i]) < vc.extractNumber(chunks[j])
 	})
 
 	//criando arquivo de saida
 	output, err := os.Create(outputFile)
 	if err != nil {
-		return fmt.Errorf("failed to create output file: %v", err)
+		return fmt.Errorf("failed to create merged file: %v", err)
 	}
 
 	//statement - fecha o arquivo depois que a funcao terminar de rodar
@@ -156,7 +160,7 @@ func (vc *VideoConverter) mergeChunks(intputDir, outputFile string) error {
 		// abrindo arquivo chunk
 		input, err := os.Open(chunk)
 		if err != nil {
-			return fmt.Errorf("failed to open chunk: %v", err)
+			return fmt.Errorf("failed to open chunk %s: %v", chunk, err)
 		}
 
 		// _ = nao quero usar como resultado, quero que apenas faca a copia
@@ -166,6 +170,5 @@ func (vc *VideoConverter) mergeChunks(intputDir, outputFile string) error {
 		}
 		input.Close()
 	}
-
 	return nil
 }
